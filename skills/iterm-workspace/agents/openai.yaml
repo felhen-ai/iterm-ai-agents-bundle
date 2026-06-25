@@ -1,0 +1,4 @@
+interface:
+  display_name: "iTerm Workspace"
+  short_description: "Target the caller pane safely in iTerm."
+  default_prompt: "Use iTerm Workspace to identify the caller pane and perform non-disruptive automation in the current iTerm tab."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "iTerm Diagnostics"
+  short_description: "Check iTerm automation and permissions."
+  default_prompt: "Use iTerm Diagnostics to collect a safe health report before debugging iTerm agent control problems."

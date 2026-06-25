@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+"""Small CLI for agent-safe iTerm control.
+
+The script intentionally wraps iTerm AppleScript and OSC 1337 details behind a
+JSON-oriented command surface so skills do not have to retype fragile snippets.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+SEP = "\x1f"
+APP_NAME = "iTerm"
+
+
+class ItermError(RuntimeError):
+    pass
+
+
+def run_osascript(source: str, args: list[str] | None = None) -> str:
+    cmd = ["/usr/bin/osascript", "-"]
+    if args:
+        cmd.extend(args)
+    proc = subprocess.run(
+        cmd,
+        input=source,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise ItermError(proc.stderr.strip() or proc.stdout.strip() or "osascript failed")
+    return proc.stdout.rstrip("\n")
+
+
+def json_out(data: Any) -> None:
+    print(json.dumps(data, indent=2, sort_keys=True))
+
+
+def current_tty() -> str | None:
+    try:
+        if os.isatty(0):
+            return os.ttyname(0)
+    except OSError:
+        return None
+    try:
+        out = subprocess.run(
+            ["tty"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).stdout.strip()
+        if out and out != "not a tty":
+            return out
+    except OSError:
+        pass
+    return None
+
+
+LIST_SCRIPT = r'''
+set sep to ASCII character 31
+tell application "iTerm"
+  if (count of windows) is 0 then return ""
+  set currentWindowId to id of current window as text
+  set currentSessionId to id of current session of current window as text
+  set out to ""
+  repeat with w in windows
+    set windowId to id of w as text
+    set windowName to name of w as text
+    set isCurrentWindow to "false"
+    if windowId is currentWindowId then set isCurrentWindow to "true"
+    repeat with tabNumber from 1 to count of tabs of w
+      set t to tab tabNumber of w
+      set tabIndex to tabNumber as text
+      set currentTabSessionId to id of current session of t as text
+      repeat with s in sessions of t
+        set sessionId to id of s as text
+        set isCurrentSession to "false"
+        if sessionId is currentSessionId then set isCurrentSession to "true"
+        set isCurrentTabSession to "false"
+        if sessionId is currentTabSessionId then set isCurrentTabSession to "true"
+        set out to out & windowId & sep & windowName & sep & isCurrentWindow & sep & tabIndex & sep & sessionId & sep & (name of s as text) & sep & (tty of s as text) & sep & ((is at shell prompt of s) as text) & sep & isCurrentSession & sep & isCurrentTabSession & linefeed
+      end repeat
+    end repeat
+  end repeat
+  return out
+end tell
+'''
+
+
+CURRENT_SESSION_SCRIPT = r'''
+set sep to ASCII character 31
+tell application "iTerm"
+  if (count of windows) is 0 then error "iTerm has no windows"
+  tell current session of current window
+    return (id as text) & sep & (name as text) & sep & (tty as text) & sep & ((is at shell prompt) as text)
+  end tell
+end tell
+'''
+
+
+def parse_bool(value: str) -> bool:
+    return value.lower() == "true"
+
+
+def list_sessions() -> dict[str, Any]:
+    raw = run_osascript(LIST_SCRIPT)
+    windows: dict[str, dict[str, Any]] = {}
+    sessions: list[dict[str, Any]] = []
+    current_session_id: str | None = None
+
+    for line in raw.splitlines():
+        if not line:
+            continue
+        parts = line.split(SEP)
+        if len(parts) != 10:
+            continue
+        (
+            window_id,
+            window_name,
+            is_current_window,
+            tab_index,
+            session_id,
+            session_name,
+            tty,
+            is_at_prompt,
+            is_current_session,
+            is_current_tab_session,
+        ) = parts
+        window = windows.setdefault(
+            window_id,
+            {
+                "id": window_id,
+                "name": window_name,
+                "current": parse_bool(is_current_window),
+                "tabs": {},
+            },
+        )
+        tab = window["tabs"].setdefault(tab_index, {"index": int(tab_index), "sessions": []})
+        session = {
+            "id": session_id,
+            "name": session_name,
+            "tty": tty,
+            "is_at_shell_prompt": parse_bool(is_at_prompt),
+            "current": parse_bool(is_current_session),
+            "current_in_tab": parse_bool(is_current_tab_session),
+            "window_id": window_id,
+            "tab_index": int(tab_index),
+        }
+        if session["current"]:
+            current_session_id = session_id
+        tab["sessions"].append(session)
+        sessions.append(session)
+
+    window_list: list[dict[str, Any]] = []
+    for window in windows.values():
+        tabs = [window["tabs"][key] for key in sorted(window["tabs"], key=lambda x: int(x))]
+        window["tabs"] = tabs
+        window_list.append(window)
+
+    return {
+        "windows": sorted(window_list, key=lambda item: int(item["id"])),
+        "sessions": sessions,
+        "current_session_id": current_session_id,
+    }
+
+
+def current_session() -> dict[str, Any]:
+    raw = run_osascript(CURRENT_SESSION_SCRIPT)
+    session_id, name, tty, prompt = raw.split(SEP)
+    return {
+        "id": session_id,
+        "name": name,
+        "tty": tty,
+        "is_at_shell_prompt": parse_bool(prompt),
+    }
+
+
+def find_one_session(target: str) -> tuple[dict[str, Any], str]:
+    data = list_sessions()
+    sessions = data["sessions"]
+
+    if target in ("current", "focused"):
+        sid = data["current_session_id"]
+        for session in sessions:
+            if session["id"] == sid:
+                return session, "current"
+        raise ItermError("could not resolve current iTerm session")
+
+    if target == "caller":
+        tty = current_tty()
+        if tty:
+            for session in sessions:
+                if session["tty"] == tty:
+                    return session, "caller-tty"
+        sid = data["current_session_id"]
+        for session in sessions:
+            if session["id"] == sid:
+                return session, "caller-fallback-current"
+        raise ItermError("could not resolve caller or current iTerm session")
+
+    if target.startswith("session:"):
+        wanted = target.split(":", 1)[1]
+        for session in sessions:
+            if session["id"] == wanted:
+                return session, "session-id"
+        raise ItermError(f"no iTerm session with id {wanted}")
+
+    if target.startswith("tty:"):
+        wanted = target.split(":", 1)[1]
+        for session in sessions:
+            if session["tty"] == wanted:
+                return session, "tty"
+        raise ItermError(f"no iTerm session with tty {wanted}")
+
+    raise ItermError(f"unsupported target {target!r}; use caller, current, session:<id>, or tty:<path>")
+
+
+def resolve_target(target: str) -> dict[str, Any]:
+    session, source = find_one_session(target)
+    return {"target": target, "resolution": source, "session": session}
+
+
+def require_session_id(target: str) -> tuple[str, dict[str, Any]]:
+    resolved = resolve_target(target)
+    return resolved["session"]["id"], resolved
+
+
+def set_badge(args: argparse.Namespace) -> None:
+    resolved = resolve_target(args.target)
+    tty = resolved["session"].get("tty")
+    if not tty:
+        raise ItermError("target session has no tty")
+    payload = base64.b64encode(args.text.encode("utf-8")).decode("ascii")
+    sequence = f"\033]1337;SetBadgeFormat={payload}\007"
+    with open(tty, "w", encoding="utf-8", errors="ignore") as handle:
+        handle.write(sequence)
+    json_out({"ok": True, "action": "badge", "text": args.text, "target": resolved})
+
+
+SEND_SCRIPT = r'''
+on run argv
+  set wantedId to item 1 of argv
+  set payload to item 2 of argv
+  tell application "iTerm"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (id of s as text) is wantedId then
+            write s text payload
+            return id of s as text
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  error "session not found: " & wantedId
+end run
+'''
+
+
+def send_text(args: argparse.Namespace) -> None:
+    session_id, resolved = require_session_id(args.target)
+    text = args.text
+    if args.shell_quote:
+        text = shlex.quote(text)
+    if args.no_newline:
+        # iTerm's AppleScript write command sends a Return after text. For true
+        # no-newline input, write directly to the tty instead.
+        tty = resolved["session"].get("tty")
+        if not tty:
+            raise ItermError("target session has no tty")
+        with open(tty, "w", encoding="utf-8", errors="ignore") as handle:
+            handle.write(text)
+        method = "tty"
+    else:
+        run_osascript(SEND_SCRIPT, [session_id, text])
+        method = "applescript-write"
+    json_out({"ok": True, "action": "send", "method": method, "target": resolved})
+
+
+SPLIT_SCRIPT = r'''
+on run argv
+  set wantedId to item 1 of argv
+  set splitKind to item 2 of argv
+  set profileKind to item 3 of argv
+  set commandText to item 4 of argv
+  tell application "iTerm"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (id of s as text) is wantedId then
+            if splitKind is "right" then
+              if profileKind is "default" then
+                if commandText is "" then
+                  set newSession to split vertically with default profile s
+                else
+                  set newSession to split vertically with default profile s command commandText
+                end if
+              else
+                if commandText is "" then
+                  set newSession to split vertically with same profile s
+                else
+                  set newSession to split vertically with same profile s command commandText
+                end if
+              end if
+            else
+              if profileKind is "default" then
+                if commandText is "" then
+                  set newSession to split horizontally with default profile s
+                else
+                  set newSession to split horizontally with default profile s command commandText
+                end if
+              else
+                if commandText is "" then
+                  set newSession to split horizontally with same profile s
+                else
+                  set newSession to split horizontally with same profile s command commandText
+                end if
+              end if
+            end if
+            return (id of newSession as text) & (ASCII character 31) & (tty of newSession as text) & (ASCII character 31) & (name of newSession as text)
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  error "session not found: " & wantedId
+end run
+'''
+
+
+def split_session(args: argparse.Namespace) -> dict[str, Any]:
+    session_id, resolved = require_session_id(args.target)
+    direction = args.direction
+    split_kind = "right" if direction in ("right", "vertical") else "down"
+    raw = run_osascript(SPLIT_SCRIPT, [session_id, split_kind, args.profile, args.run_command or ""])
+    new_id, tty, name = raw.split(SEP)
+    result = {
+        "ok": True,
+        "action": "split",
+        "direction": direction,
+        "new_session": {"id": new_id, "tty": tty, "name": name},
+        "target": resolved,
+    }
+    if not args.return_value:
+        json_out(result)
+    return result
+
+
+def grid(args: argparse.Namespace) -> None:
+    if args.rows != 2 or args.cols != 2:
+        raise ItermError("v0 supports only --rows 2 --cols 2")
+    target_id, resolved = require_session_id(args.target)
+
+    class Obj:
+        pass
+
+    top_right_args = Obj()
+    top_right_args.target = f"session:{target_id}"
+    top_right_args.direction = "right"
+    top_right_args.profile = args.profile
+    top_right_args.run_command = args.run_command
+    top_right_args.return_value = True
+    top_right = split_session(top_right_args)
+
+    bottom_left_args = Obj()
+    bottom_left_args.target = f"session:{target_id}"
+    bottom_left_args.direction = "down"
+    bottom_left_args.profile = args.profile
+    bottom_left_args.run_command = args.run_command
+    bottom_left_args.return_value = True
+    bottom_left = split_session(bottom_left_args)
+
+    bottom_right_args = Obj()
+    bottom_right_args.target = f"session:{top_right['new_session']['id']}"
+    bottom_right_args.direction = "down"
+    bottom_right_args.profile = args.profile
+    bottom_right_args.run_command = args.run_command
+    bottom_right_args.return_value = True
+    bottom_right = split_session(bottom_right_args)
+
+    json_out(
+        {
+            "ok": True,
+            "action": "grid",
+            "rows": 2,
+            "cols": 2,
+            "preserved": resolved,
+            "created": {
+                "top_right": top_right["new_session"],
+                "bottom_left": bottom_left["new_session"],
+                "bottom_right": bottom_right["new_session"],
+            },
+        }
+    )
+
+
+WINDOW_ID_SCRIPT = r'''
+tell application "iTerm"
+  if (count of windows) is 0 then error "iTerm has no windows"
+  return id of current window as text
+end tell
+'''
+
+
+def screenshot(args: argparse.Namespace) -> None:
+    window_id = args.window_id or run_osascript(WINDOW_ID_SCRIPT)
+    output = Path(args.output).expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        ["/usr/sbin/screencapture", "-l", str(window_id), str(output)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise ItermError(proc.stderr.strip() or "screencapture failed")
+    json_out({"ok": True, "action": "screenshot", "window_id": str(window_id), "output": str(output)})
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="iterm-control")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("list", help="List iTerm windows, tabs, and sessions as JSON")
+    sub.add_parser("current", help="Print the current iTerm session as JSON")
+    sub.add_parser("identify", help="Identify caller tty and current iTerm target as JSON")
+
+    resolve = sub.add_parser("resolve", help="Resolve a target to an iTerm session")
+    resolve.add_argument("--target", default="caller")
+
+    badge = sub.add_parser("badge", help="Set iTerm badge text on a target session")
+    badge.add_argument("--target", default="caller")
+    badge.add_argument("--text", required=True)
+
+    send = sub.add_parser("send", help="Send text to a target session")
+    send.add_argument("--target", default="caller")
+    send.add_argument("--text", required=True)
+    send.add_argument("--no-newline", action="store_true", help="Write directly to tty without Return")
+    send.add_argument("--shell-quote", action="store_true", help="Shell-quote text before sending")
+
+    split = sub.add_parser("split", help="Split a target session")
+    split.add_argument("--target", default="caller")
+    split.add_argument("--direction", choices=["right", "down", "vertical", "horizontal"], default="right")
+    split.add_argument("--profile", choices=["same", "default"], default="same")
+    split.add_argument("--command", dest="run_command", default="")
+    split.set_defaults(return_value=False)
+
+    grid_cmd = sub.add_parser("grid", help="Create a 2x2 grid preserving the target session")
+    grid_cmd.add_argument("--target", default="caller")
+    grid_cmd.add_argument("--rows", type=int, default=2)
+    grid_cmd.add_argument("--cols", type=int, default=2)
+    grid_cmd.add_argument("--profile", choices=["same", "default"], default="same")
+    grid_cmd.add_argument("--command", dest="run_command", default="")
+
+    shot = sub.add_parser("screenshot", help="Screenshot an iTerm window")
+    shot.add_argument("--window-id")
+    shot.add_argument("--output", required=True)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "list":
+            json_out(list_sessions())
+        elif args.command == "current":
+            json_out(current_session())
+        elif args.command == "identify":
+            json_out(
+                {
+                    "caller_tty": current_tty(),
+                    "current": current_session(),
+                    "resolved_caller": resolve_target("caller"),
+                }
+            )
+        elif args.command == "resolve":
+            json_out(resolve_target(args.target))
+        elif args.command == "badge":
+            set_badge(args)
+        elif args.command == "send":
+            send_text(args)
+        elif args.command == "split":
+            split_session(args)
+        elif args.command == "grid":
+            grid(args)
+        elif args.command == "screenshot":
+            screenshot(args)
+        else:
+            parser.error(f"unknown command {args.command}")
+        return 0
+    except ItermError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

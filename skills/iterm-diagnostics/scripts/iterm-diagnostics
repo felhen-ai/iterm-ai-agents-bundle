@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""Support-safe diagnostics for iTerm agent control."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+CONTROL = ROOT / "iterm-control" / "scripts" / "iterm-control"
+
+
+def run(cmd: list[str]) -> tuple[int, str, str]:
+    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+
+def control_json(args: list[str]) -> tuple[bool, object | str]:
+    code, out, err = run([str(CONTROL), *args])
+    if code != 0:
+        return False, err or out
+    try:
+        return True, json.loads(out)
+    except json.JSONDecodeError:
+        return False, out
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="iterm-diagnostics")
+    parser.add_argument("--include-context", action="store_true", help="Include window names, session names, and tty paths")
+    parser.add_argument("--test-badge", help="Set a temporary badge on the current session")
+    args = parser.parse_args(argv)
+
+    report: dict[str, object] = {
+        "tools": {
+            "osascript": shutil.which("osascript"),
+            "screencapture": shutil.which("screencapture"),
+            "iterm_control": str(CONTROL) if CONTROL.exists() else None,
+        },
+        "checks": [],
+    }
+
+    def check(name: str, ok: bool, detail: object) -> None:
+        report["checks"].append({"name": name, "ok": ok, "detail": detail})
+
+    code, out, err = run(["osascript", "-e", 'id of application "iTerm"'])
+    check("iterm_bundle", code == 0 and "com.googlecode.iterm2" in out, out or err)
+
+    ok, current = control_json(["current"])
+    if args.include_context:
+        check("current_session", ok, current)
+    else:
+        detail = "available" if ok else current
+        check("current_session", ok, detail)
+
+    ok, listing = control_json(["list"])
+    if ok and isinstance(listing, dict):
+        sessions = listing.get("sessions", [])
+        windows = listing.get("windows", [])
+        detail = {"windows": len(windows), "sessions": len(sessions)}
+        if args.include_context:
+            detail["listing"] = listing
+        check("list_sessions", True, detail)
+    else:
+        check("list_sessions", False, listing)
+
+    ok, identify = control_json(["identify"])
+    if args.include_context:
+        check("identify", ok, identify)
+    else:
+        check("identify", ok, "available" if ok else identify)
+
+    if args.test_badge:
+        ok, badge = control_json(["badge", "--target", "current", "--text", args.test_badge])
+        check("badge_test", ok, badge if args.include_context else ("set" if ok else badge))
+
+    print(json.dumps(report, indent=2, sort_keys=True))
+    failed = [item for item in report["checks"] if not item["ok"]]
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
