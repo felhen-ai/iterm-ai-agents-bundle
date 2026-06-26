@@ -1,4 +1,4 @@
 interface:
   display_name: "iTerm Control"
-  short_description: "Control iTerm panes, badges, and commands."
-  default_prompt: "Use iTerm Control to inspect the current iTerm layout and make the requested pane, badge, command, or screenshot change."
+  short_description: "Control iTerm tabs, windows, panes, focus, badges, and commands."
+  default_prompt: "Use iTerm Control to inspect the current iTerm layout and make the requested tab, window, pane, focus, close, badge, command, health, or screenshot change."

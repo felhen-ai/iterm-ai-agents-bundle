@@ -407,6 +407,296 @@ def grid(args: argparse.Namespace) -> None:
     )
 
 
+TAB_SCRIPT = r'''
+on run argv
+  set wantedId to item 1 of argv
+  set profileKind to item 2 of argv
+  set commandText to item 3 of argv
+  set sep to ASCII character 31
+  tell application "iTerm"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (id of s as text) is wantedId then
+            if profileKind is "default" then
+              if commandText is "" then
+                set newTab to create tab with default profile w
+              else
+                set newTab to create tab with default profile w command commandText
+              end if
+            else
+              set sourceProfile to profile name of s as text
+              if commandText is "" then
+                set newTab to create tab w with profile sourceProfile
+              else
+                set newTab to create tab w with profile sourceProfile command commandText
+              end if
+            end if
+            tell current session of newTab
+              return (id as text) & sep & (tty as text) & sep & (name as text) & sep & (id of w as text)
+            end tell
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  error "session not found: " & wantedId
+end run
+'''
+
+
+def create_tab(args: argparse.Namespace) -> None:
+    session_id, resolved = require_session_id(args.target)
+    raw = run_osascript(TAB_SCRIPT, [session_id, args.profile, args.run_command or ""])
+    new_id, tty, name, window_id = raw.split(SEP)
+    new_session = {"id": new_id, "tty": tty, "name": name, "window_id": window_id}
+    for session in list_sessions()["sessions"]:
+        if session["id"] == new_id:
+            new_session.update(session)
+            break
+    json_out(
+        {
+            "ok": True,
+            "action": "tab",
+            "new_session": new_session,
+            "target": resolved,
+        }
+    )
+
+
+FOCUS_SCRIPT = r'''
+on run argv
+  set wantedId to item 1 of argv
+  tell application "iTerm"
+    activate
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (id of s as text) is wantedId then
+            select w
+            select t
+            select s
+            return id of s as text
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  error "session not found: " & wantedId
+end run
+'''
+
+
+def focus_session(args: argparse.Namespace) -> None:
+    session_id, resolved = require_session_id(args.target)
+    run_osascript(FOCUS_SCRIPT, [session_id])
+    refreshed = None
+    for session in list_sessions()["sessions"]:
+        if session["id"] == session_id:
+            refreshed = session
+            break
+    json_out(
+        {
+            "ok": True,
+            "action": "focus",
+            "target": resolved,
+            "focused_session": refreshed or resolved["session"],
+        }
+    )
+
+
+WINDOW_SCRIPT = r'''
+on run argv
+  set wantedId to item 1 of argv
+  set profileKind to item 2 of argv
+  set commandText to item 3 of argv
+  set sep to ASCII character 31
+  tell application "iTerm"
+    set sourceProfile to ""
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (id of s as text) is wantedId then
+            set sourceProfile to profile name of s as text
+          end if
+        end repeat
+      end repeat
+    end repeat
+    if profileKind is "default" then
+      if commandText is "" then
+        set newWindow to create window with default profile
+      else
+        set newWindow to create window with default profile command commandText
+      end if
+    else
+      if sourceProfile is "" then error "session not found: " & wantedId
+      if commandText is "" then
+        set newWindow to create window with profile sourceProfile
+      else
+        set newWindow to create window with profile sourceProfile command commandText
+      end if
+    end if
+    tell current session of newWindow
+      return (id as text) & sep & (tty as text) & sep & (name as text) & sep & (id of newWindow as text) & sep & (name of newWindow as text)
+    end tell
+  end tell
+end run
+'''
+
+
+def create_window(args: argparse.Namespace) -> None:
+    session_id, resolved = require_session_id(args.target)
+    raw = run_osascript(WINDOW_SCRIPT, [session_id, args.profile, args.run_command or ""])
+    new_id, tty, name, window_id, window_name = raw.split(SEP)
+    new_session = {"id": new_id, "tty": tty, "name": name, "window_id": window_id}
+    for session in list_sessions()["sessions"]:
+        if session["id"] == new_id:
+            new_session.update(session)
+            break
+    json_out(
+        {
+            "ok": True,
+            "action": "window",
+            "new_window": {"id": window_id, "name": window_name},
+            "new_session": new_session,
+            "target": resolved,
+        }
+    )
+
+
+CLOSE_SCRIPT = r'''
+on run argv
+  set wantedId to item 1 of argv
+  set closeScope to item 2 of argv
+  set sep to ASCII character 31
+  tell application "iTerm"
+    repeat with w in windows
+      repeat with tabNumber from 1 to count of tabs of w
+        set t to tab tabNumber of w
+        repeat with s in sessions of t
+          if (id of s as text) is wantedId then
+            set sessionId to id of s as text
+            set windowId to id of w as text
+            set tabIndex to tabNumber as text
+            if closeScope is "session" then
+              close s
+            else if closeScope is "tab" then
+              close t
+            else if closeScope is "window" then
+              close w
+            else
+              error "unsupported close scope: " & closeScope
+            end if
+            return closeScope & sep & sessionId & sep & windowId & sep & tabIndex
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  error "session not found: " & wantedId
+end run
+'''
+
+
+def close_scope_sessions(resolved: dict[str, Any], scope: str) -> list[dict[str, Any]]:
+    target = resolved["session"]
+    sessions = list_sessions()["sessions"]
+    if scope == "session":
+        return [session for session in sessions if session["id"] == target["id"]]
+    if scope == "tab":
+        return [
+            session
+            for session in sessions
+            if session["window_id"] == target["window_id"] and session["tab_index"] == target["tab_index"]
+        ]
+    if scope == "window":
+        return [session for session in sessions if session["window_id"] == target["window_id"]]
+    raise ItermError(f"unsupported close scope: {scope}")
+
+
+def close_target(args: argparse.Namespace) -> None:
+    if args.target in ("caller", "current", "focused") and not args.force:
+        raise ItermError("close requires --force when target is caller, current, or focused")
+
+    session_id, resolved = require_session_id(args.target)
+    affected = close_scope_sessions(resolved, args.scope)
+    if not affected:
+        raise ItermError("close target disappeared before close")
+
+    if not args.force:
+        if any(session.get("current") for session in affected):
+            raise ItermError("refusing to close a scope containing the current iTerm session without --force")
+        busy = [session for session in affected if not session.get("is_at_shell_prompt")]
+        if busy:
+            busy_ids = ", ".join(session["id"] for session in busy)
+            raise ItermError(f"refusing to close sessions not at shell prompt without --force: {busy_ids}")
+
+    raw = run_osascript(CLOSE_SCRIPT, [session_id, args.scope])
+    scope, closed_session_id, window_id, tab_index = raw.split(SEP)
+    json_out(
+        {
+            "ok": True,
+            "action": "close",
+            "scope": scope,
+            "closed": {
+                "session_id": closed_session_id,
+                "window_id": window_id,
+                "tab_index": int(tab_index),
+                "affected_sessions": affected,
+            },
+            "target": resolved,
+            "forced": args.force,
+        }
+    )
+
+
+def health(args: argparse.Namespace) -> None:
+    data = list_sessions()
+    sessions = data["sessions"]
+    windows = data["windows"]
+    tab_count = sum(len(window["tabs"]) for window in windows)
+    current = next((session for session in sessions if session.get("current")), None)
+    warnings: list[str] = []
+
+    caller_resolution = None
+    caller_error = None
+    try:
+        caller_resolution = resolve_target("caller")
+        if caller_resolution["resolution"] == "caller-fallback-current":
+            warnings.append("caller-fallback-current")
+    except ItermError as exc:
+        caller_error = str(exc)
+        warnings.append("caller-unresolved")
+
+    non_prompt = [session for session in sessions if not session.get("is_at_shell_prompt")]
+    if non_prompt:
+        warnings.append("sessions-not-at-shell-prompt")
+    if not windows:
+        warnings.append("no-windows")
+    if not current:
+        warnings.append("no-current-session")
+
+    json_out(
+        {
+            "ok": bool(windows and current),
+            "action": "health",
+            "app": APP_NAME,
+            "counts": {
+                "windows": len(windows),
+                "tabs": tab_count,
+                "sessions": len(sessions),
+                "sessions_not_at_shell_prompt": len(non_prompt),
+            },
+            "caller_tty": current_tty(),
+            "current_session": current,
+            "caller": caller_resolution,
+            "caller_error": caller_error,
+            "warnings": warnings,
+            "sessions_not_at_shell_prompt": non_prompt,
+        }
+    )
+
+
 WINDOW_ID_SCRIPT = r'''
 tell application "iTerm"
   if (count of windows) is 0 then error "iTerm has no windows"
@@ -438,9 +728,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("list", help="List iTerm windows, tabs, and sessions as JSON")
     sub.add_parser("current", help="Print the current iTerm session as JSON")
     sub.add_parser("identify", help="Identify caller tty and current iTerm target as JSON")
+    sub.add_parser("health", help="Summarize iTerm automation readiness and warnings as JSON")
 
     resolve = sub.add_parser("resolve", help="Resolve a target to an iTerm session")
     resolve.add_argument("--target", default="caller")
+
+    focus = sub.add_parser("focus", help="Focus/select a target session in iTerm")
+    focus.add_argument("--target", default="caller")
 
     badge = sub.add_parser("badge", help="Set iTerm badge text on a target session")
     badge.add_argument("--target", default="caller")
@@ -466,6 +760,21 @@ def build_parser() -> argparse.ArgumentParser:
     grid_cmd.add_argument("--profile", choices=["same", "default"], default="same")
     grid_cmd.add_argument("--command", dest="run_command", default="")
 
+    tab = sub.add_parser("tab", help="Create a new tab in the target session's window")
+    tab.add_argument("--target", default="caller")
+    tab.add_argument("--profile", choices=["same", "default"], default="same")
+    tab.add_argument("--command", dest="run_command", default="")
+
+    window = sub.add_parser("window", help="Create a new iTerm window")
+    window.add_argument("--target", default="caller")
+    window.add_argument("--profile", choices=["same", "default"], default="same")
+    window.add_argument("--command", dest="run_command", default="")
+
+    close = sub.add_parser("close", help="Close a target session, tab, or window")
+    close.add_argument("--target", required=True)
+    close.add_argument("--scope", choices=["session", "tab", "window"], default="session")
+    close.add_argument("--force", action="store_true", help="Allow closing current or non-prompt sessions")
+
     shot = sub.add_parser("screenshot", help="Screenshot an iTerm window")
     shot.add_argument("--window-id")
     shot.add_argument("--output", required=True)
@@ -489,8 +798,12 @@ def main(argv: list[str] | None = None) -> int:
                     "resolved_caller": resolve_target("caller"),
                 }
             )
+        elif args.command == "health":
+            health(args)
         elif args.command == "resolve":
             json_out(resolve_target(args.target))
+        elif args.command == "focus":
+            focus_session(args)
         elif args.command == "badge":
             set_badge(args)
         elif args.command == "send":
@@ -499,6 +812,12 @@ def main(argv: list[str] | None = None) -> int:
             split_session(args)
         elif args.command == "grid":
             grid(args)
+        elif args.command == "tab":
+            create_tab(args)
+        elif args.command == "window":
+            create_window(args)
+        elif args.command == "close":
+            close_target(args)
         elif args.command == "screenshot":
             screenshot(args)
         else:
